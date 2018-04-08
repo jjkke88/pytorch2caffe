@@ -1,6 +1,5 @@
 import sys
-
-sys.path.append('/extra/caffe/build_caffe/caffe_rtpose/python')
+sys.path.insert(0,'/home/dalong/caffe/python/')
 import caffe
 from collections import OrderedDict
 import torch.nn as nn
@@ -14,6 +13,7 @@ import pydot
 layer_dict = {'ConvNdBackward': 'Convolution',
               'ThresholdBackward': 'ReLU',
               'MaxPool2dBackward': 'Pooling',
+              'MaxPool2DBackward': 'Pooling',
               'AvgPool2dBackward': 'Pooling',
               'DropoutBackward': 'Dropout',
               'AddmmBackward': 'InnerProduct',
@@ -21,8 +21,10 @@ layer_dict = {'ConvNdBackward': 'Convolution',
               'AddBackward': 'Eltwise',
               'ViewBackward': 'Reshape',
               'ConcatBackward': 'Concat',
+              'CatBackward': 'Concat',
               'UpsamplingNearest2d': 'Deconvolution',
               'UpsamplingBilinear2d': 'Deconvolution',
+              'UpsamplingNearest2dBackward': 'Deconvolution',
               'SigmoidBackward': 'Sigmoid',
               'LeakyReLUBackward': 'ReLU',
               'NegateBackward': 'Power',
@@ -68,9 +70,9 @@ def pytorch2caffe(input_var, output_var, protofile, caffemodel):
             print('converting %s' % parent_name)
             if parent_type == 'ConvNdBackward':
                 if func.next_functions[1][0] is not None:
-                    weights = func.next_functions[1][0].variable.data
+                    weights = func.next_functions[1][0].variable.data.cpu()
                     if func.next_functions[2][0]:
-                        biases = func.next_functions[2][0].variable.data
+                        biases = func.next_functions[2][0].variable.data.cpu()
                     else:
                         biases = None
                     save_conv2caffe(weights, biases, params[parent_name])
@@ -82,18 +84,22 @@ def pytorch2caffe(input_var, output_var, protofile, caffemodel):
 
                 affine = func.next_functions[1][0] is not None
                 if affine:
-                    scale_weights = func.next_functions[1][0].variable.data
-                    scale_biases = func.next_functions[2][0].variable.data
+                    scale_weights = func.next_functions[1][0].variable.data.cpu()
+                    scale_biases = func.next_functions[2][0].variable.data.cpu()
                     scale_name = parent_name + "_scale"
                     save_scale2caffe(scale_weights, scale_biases, params[scale_name])
             elif parent_type == 'AddmmBackward':
-                biases = func.next_functions[0][0].variable.data
-                weights = func.next_functions[2][0].next_functions[0][0].variable.data
+                biases = func.next_functions[0][0].variable.data.cpu()
+                weights = func.next_functions[2][0].next_functions[0][0].variable.data.cpu()
                 save_fc2caffe(weights, biases, params[parent_name])
             elif parent_type == 'UpsamplingNearest2d':
                 print('UpsamplingNearest2d')
 
-    convert_layer(output_var.grad_fn)
+    if isinstance(output_var, tuple):
+        for output in output_var:
+            convert_layer(output.grad_fn)
+    else:
+        convert_layer(output_var.grad_fn)
     print('save caffemodel to %s' % caffemodel)
     net.save(caffemodel)
 
@@ -113,8 +119,8 @@ def save_fc2caffe(weights, biases, fc_param):
 
 
 def save_bn2caffe(running_mean, running_var, bn_param):
-    bn_param[0].data[...] = running_mean.numpy()
-    bn_param[1].data[...] = running_var.numpy()
+    bn_param[0].data[...] = running_mean.cpu().numpy()
+    bn_param[1].data[...] = running_var.cpu().numpy()
     bn_param[2].data[...] = np.array([1.0])
 
 
@@ -123,6 +129,13 @@ def save_scale2caffe(weights, biases, scale_param):
     scale_param[0].data[...] = weights.numpy()
 
 
+def is_dict_in_list(d1, dict_list):
+    for d2 in dict_list:
+        tag = (d1['top'] == d2['top']) and (d1['bottom'] == d2['bottom']) and (d1['name'] == d2['name']) and (d1['type'] == d2['type'])
+        if tag:
+            return True
+    return False
+    
 def pytorch2prototxt(input_var, output_var):
     global layer_id
     net_info = OrderedDict()
@@ -186,7 +199,7 @@ def pytorch2prototxt(input_var, output_var):
             negative_slope = func.additional_args[0]
             layer['relu_param'] = {'negative_slope': negative_slope}
 
-        elif parent_type == 'UpsamplingNearest2d':
+        elif parent_type == 'UpsamplingNearest2d' or parent_type == 'UpsamplingNearest2dBackward':
             conv_param = OrderedDict()
             factor = func.scale_factor
             conv_param['num_output'] = func.saved_tensors[0].size(1)
@@ -239,6 +252,7 @@ def pytorch2prototxt(input_var, output_var):
                 conv_param['kernel_w'] = weights.size(3)
                 conv_param['stride'] = func.stride[0]
                 conv_param['dilation'] = func.dilation[0]
+                conv_param['group'] = func.groups
                 if func.next_functions[2][0] == None:
                     conv_param['bias_term'] = 'false'
                 layer['convolution_param'] = conv_param
@@ -256,7 +270,7 @@ def pytorch2prototxt(input_var, output_var):
             bn_layer['batch_norm_param'] = batch_norm_param
 
             affine = func.next_functions[1][0] is not None
-            # func.next_functions[1][0].variable.data
+            # func.next_functions[1][0].variable.cpu().data
             if affine:
                 scale_layer = OrderedDict()
                 scale_layer['name'] = parent_name + "_scale"
@@ -313,16 +327,24 @@ def pytorch2prototxt(input_var, output_var):
         layer['top'] = parent_top  # reset layer['top'] as parent_top may change
         if parent_type != 'ViewBackward':
             if parent_type == "BatchNormBackward":
-                layers.append(bn_layer)
+                if not is_dict_in_list(bn_layer, layers):
+                    layers.append(bn_layer)
                 if scale_layer is not None:
-                    layers.append(scale_layer)
+                    if not is_dict_in_list(scale_layer, layers):
+                        layers.append(scale_layer)
             else:
-                layers.append(layer)
+                if not is_dict_in_list(layer, layers):
+                    layers.append(layer)
                 # layer_id = layer_id + 1
         top_names[func] = parent_top
+        
         return parent_top
 
-    add_layer(output_var.grad_fn)
+    if isinstance(output_var, tuple):
+        for output in output_var:
+            add_layer(output.grad_fn)
+    else:
+        add_layer(output_var.grad_fn)
     net_info['props'] = props
     net_info['layers'] = layers
     return net_info
